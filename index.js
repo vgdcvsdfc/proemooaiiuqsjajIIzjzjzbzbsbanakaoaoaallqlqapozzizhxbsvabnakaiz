@@ -5,10 +5,27 @@ const { v4: uuidv4 } = require('uuid');
 const app = express();
 const { Client, GatewayIntentBits, EmbedBuilder, PermissionsBitField } = require('discord.js');
 
+const requiredEnvVars = ['DISCORD_CLIENT_ID', 'DISCORD_CLIENT_SECRET'];
+const missingVars = requiredEnvVars.filter(v => !process.env[v]);
+if (missingVars.length > 0) {
+    console.error('❌ Missing required env vars:', missingVars.join(', '));
+    console.log('⚠️ Discord OAuth will not work until these are configured');
+} else {
+    console.log('✅ Discord OAuth environment variables loaded');
+}
+
 app.set('trust proxy', 1);
 app.use(express.json({ limit: '10mb' }));
 app.use(cookieParser());
 app.use(express.static(path.join(__dirname, 'public')));
+
+app.use((req, res, next) => {
+    if (req.path.startsWith('/api/') || req.path.startsWith('/auth/')) {
+        const sessionUser = req.cookies?.session_token ? 'has_token' : 'no_token';
+        console.log(`${req.method} ${req.path} - Cookie: ${sessionUser}`);
+    }
+    next();
+});
 
 const sessions = new Map();
 const userToSessionToken = new Map();
@@ -516,26 +533,65 @@ app.get('/api/stats', async (req, res) => {
 app.get('/api/user-profile', async (req, res) => {
     try {
         const sessionUser = getSessionUser(req);
+        console.log('Session check:', sessionUser ? sessionUser.username : 'null');
         
-        if (sessionUser) {
-            const isUserAdmin = await db.isAdmin(sessionUser.discord_id);
-            const isUserOwner = await db.isOwner(sessionUser.discord_id);
-            const verifiedUser = await db.getVerifiedUser(sessionUser.discord_id);
-            const expiresAt = verifiedUser ? verifiedUser.expires_at_ms : null;
-            
-            res.json({
-                ...sessionUser,
-                is_admin: isUserAdmin,
-                is_owner: isUserOwner,
-                is_site_owner: sessionUser.discord_id === OWNER_ID,
-                expires_at: expiresAt
-            });
-        } else {
-            res.json({
+        if (!sessionUser) {
+            return res.json({ 
+                discord_id: null,
                 username: 'Guest',
                 avatar: 'https://cdn.discordapp.com/embed/avatars/0.png'
             });
         }
+        
+        const now = Date.now();
+        const verifiedUser = await db.getVerifiedUser(sessionUser.discord_id);
+        const expiresAt = verifiedUser ? verifiedUser.expires_at_ms : null;
+        
+        if (expiresAt && expiresAt < now) {
+            console.log('Session expired for user:', sessionUser.username);
+            return res.json({ 
+                discord_id: null,
+                username: 'Guest',
+                avatar: 'https://cdn.discordapp.com/embed/avatars/0.png'
+            });
+        }
+        
+        const isUserAdmin = await db.isAdmin(sessionUser.discord_id);
+        const isUserOwner = await db.isOwner(sessionUser.discord_id);
+        
+        res.json({
+            discord_id: sessionUser.discord_id,
+            username: sessionUser.username,
+            avatar: sessionUser.avatar,
+            expires_at: expiresAt,
+            is_admin: isUserAdmin,
+            is_owner: isUserOwner,
+            is_site_owner: sessionUser.discord_id === OWNER_ID
+        });
+    } catch (error) {
+        console.error('User profile error:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+app.get('/api/debug/session', (req, res) => {
+    const sessionToken = req.cookies?.session_token;
+    const sessionData = sessionToken ? sessions.get(sessionToken) : null;
+    
+    res.json({
+        has_cookie: !!sessionToken,
+        cookie_preview: sessionToken ? sessionToken.substring(0, 8) + '...' : null,
+        session_found: !!sessionData,
+        user: sessionData?.user || null,
+        expires_at: sessionData?.expires_at || null,
+        total_sessions: sessions.size
+    });
+});
+
+app.get('/api/debug/users', async (req, res) => {
+    try {
+        const result = await db.pool.query('SELECT discord_id, discord_username, verified_at, expires_at FROM verified_users ORDER BY verified_at DESC LIMIT 10');
+        res.json(result.rows);
     } catch (error) {
         res.status(500).json({ error: error.message });
     }
@@ -558,12 +614,24 @@ app.get('/auth/discord', (req, res) => {
 
 app.get('/auth/discord/callback', async (req, res) => {
     const code = req.query.code;
+    const error = req.query.error;
+    
+    console.log('OAuth callback received:', { hasCode: !!code, error: error || 'none' });
+    
+    if (error) {
+        console.error('❌ Discord OAuth error:', error);
+        return res.redirect('/#activation?error=discord_denied');
+    }
     
     if (!code) {
+        console.error('❌ No code received from Discord');
         return res.redirect('/#activation?error=no_code');
     }
     
     try {
+        console.log('Exchanging code for token...');
+        console.log('Using redirect URI:', REDIRECT_URI);
+        
         const tokenResponse = await fetch('https://discord.com/api/oauth2/token', {
             method: 'POST',
             headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
@@ -579,8 +647,11 @@ app.get('/auth/discord/callback', async (req, res) => {
         const tokenData = await tokenResponse.json();
         
         if (!tokenData.access_token) {
+            console.error('❌ Token exchange failed:', tokenData);
             return res.redirect('/#activation?error=token_failed');
         }
+        
+        console.log('✅ Token obtained, fetching user data...');
         
         const userResponse = await fetch('https://discord.com/api/users/@me', {
             headers: { Authorization: `Bearer ${tokenData.access_token}` }
@@ -589,17 +660,22 @@ app.get('/auth/discord/callback', async (req, res) => {
         const userData = await userResponse.json();
         
         if (!userData.id) {
+            console.error('❌ Failed to get user data:', userData);
             return res.redirect('/#activation?error=user_failed');
         }
+        
+        console.log('✅ Got user data:', userData.username, userData.id);
         
         const avatarUrl = userData.avatar 
             ? `https://cdn.discordapp.com/avatars/${userData.id}/${userData.avatar}.png`
             : 'https://cdn.discordapp.com/embed/avatars/0.png';
         
         const expiresAt = await db.verifyUserDb(userData.id, userData.username, avatarUrl);
+        console.log('✅ User saved to database, expires:', new Date(expiresAt).toISOString());
         
         const isUserAdmin = await db.isAdmin(userData.id);
         const isUserOwner = await db.isOwner(userData.id);
+        const isSiteOwner = userData.id === OWNER_ID;
         
         const sessionUserData = {
             discord_id: userData.id,
@@ -607,16 +683,17 @@ app.get('/auth/discord/callback', async (req, res) => {
             avatar: avatarUrl,
             expires_at: expiresAt,
             is_admin: isUserAdmin,
-            is_owner: isUserOwner
+            is_owner: isUserOwner,
+            is_site_owner: isSiteOwner
         };
         
-        createSession(res, sessionUserData);
-        
-        console.log(`✅ User verified: ${userData.username} (${userData.id})`);
+        const sessionToken = createSession(res, sessionUserData);
+        console.log('✅ Session created:', sessionToken.substring(0, 8) + '...');
+        console.log('✅ User verified: ${userData.username} (${userData.id}) - Admin: ${isUserAdmin}, Owner: ${isUserOwner}, SiteOwner: ${isSiteOwner}');
         
         res.redirect(`/#activation?verified=true&expires=${expiresAt}`);
     } catch (error) {
-        console.error('OAuth2 error:', error);
+        console.error('❌ OAuth2 error:', error);
         res.redirect('/#activation?error=oauth_failed');
     }
 });
